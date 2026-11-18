@@ -23,7 +23,6 @@ import (
 
 type addrinfo struct {
 	file     windows.Handle
-	mapview  windows.Handle
 	writable bool
 }
 
@@ -38,7 +37,6 @@ func mmap(len int, prot, flags, hfile uintptr, off int64) ([]byte, error) {
 	case prot&COPY != 0:
 		flProtect = windows.PAGE_WRITECOPY
 		dwDesiredAccess = windows.FILE_MAP_COPY
-		writable = true
 	case prot&RDWR != 0:
 		flProtect = windows.PAGE_READWRITE
 		dwDesiredAccess = windows.FILE_MAP_WRITE
@@ -60,6 +58,9 @@ func mmap(len int, prot, flags, hfile uintptr, off int64) ([]byte, error) {
 	if h == 0 {
 		return nil, os.NewSyscallError("CreateFileMapping", errno)
 	}
+	// The mapped view keeps the mapping object alive, so the handle can be
+	// closed once the view is mapped. Unmap only unmaps the view.
+	defer windows.CloseHandle(h)
 
 	// Actually map a view of the data into memory. The view's size
 	// is the length the user requested.
@@ -72,7 +73,6 @@ func mmap(len int, prot, flags, hfile uintptr, off int64) ([]byte, error) {
 	handleLock.Lock()
 	handleMap[addr] = &addrinfo{
 		file:     windows.Handle(hfile),
-		mapview:  h,
 		writable: writable,
 	}
 	handleLock.Unlock()
@@ -123,10 +123,7 @@ func (m MMap) unlock() error {
 }
 
 func (m MMap) unmap() error {
-	err := m.flush()
-	if err != nil {
-		return err
-	}
+	flushErr := m.flush()
 
 	addr := m.header().Data
 	// Lock the UnmapViewOfFile along with the handleMap deletion.
@@ -136,18 +133,12 @@ func (m MMap) unmap() error {
 	// we're trying to remove our old addr/handle pair.
 	handleLock.Lock()
 	defer handleLock.Unlock()
-	err = windows.UnmapViewOfFile(addr)
-	if err != nil {
-		return err
-	}
-
-	handle, ok := handleMap[addr]
-	if !ok {
-		// should be impossible; we would've errored above
+	if _, ok := handleMap[addr]; !ok {
 		return errors.New("unknown base address")
 	}
+	if err := windows.UnmapViewOfFile(addr); err != nil {
+		return err
+	}
 	delete(handleMap, addr)
-
-	e := windows.CloseHandle(windows.Handle(handle.mapview))
-	return os.NewSyscallError("CloseHandle", e)
+	return flushErr
 }
