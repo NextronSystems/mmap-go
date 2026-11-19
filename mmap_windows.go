@@ -22,8 +22,9 @@ import (
 // We keep this map so that we can get back the original handle from the memory address.
 
 type addrinfo struct {
-	file     windows.Handle
-	writable bool
+	// file is a duplicate of the mapped file's handle, used to flush the view to disk.
+	// It is zero if the mapping's data never lands on disk.
+	file windows.Handle
 }
 
 var handleLock sync.Mutex
@@ -32,7 +33,7 @@ var handleMap = map[uintptr]*addrinfo{}
 func mmap(len int, prot, flags, hfile uintptr, off int64) ([]byte, error) {
 	flProtect := uint32(windows.PAGE_READONLY)
 	dwDesiredAccess := uint32(windows.FILE_MAP_READ)
-	writable := false
+	writesToDisk := false
 	switch {
 	case prot&COPY != 0:
 		flProtect = windows.PAGE_WRITECOPY
@@ -40,11 +41,29 @@ func mmap(len int, prot, flags, hfile uintptr, off int64) ([]byte, error) {
 	case prot&RDWR != 0:
 		flProtect = windows.PAGE_READWRITE
 		dwDesiredAccess = windows.FILE_MAP_WRITE
-		writable = true
+		writesToDisk = hfile != anonymousMappingFd
 	}
 	if prot&EXEC != 0 {
 		flProtect <<= 4
 		dwDesiredAccess |= windows.FILE_MAP_EXECUTE
+	}
+
+	mapped := false
+
+	var flushHandle windows.Handle
+	if writesToDisk {
+		// Duplicate the handle so we can use it to flush the view later.
+		// We must not use the original handle because the user may close it before flush is called.
+		if err := windows.DuplicateHandle(windows.CurrentProcess(), windows.Handle(hfile), windows.CurrentProcess(), &flushHandle, 0, false, windows.DUPLICATE_SAME_ACCESS); err != nil {
+			return nil, os.NewSyscallError("DuplicateHandle", err)
+		}
+		// In case of an error, close the duplicated handle again.
+		// If we succeed, the handle will be stored in the handleMap and closed when the mapping is unmapped.
+		defer func() {
+			if !mapped {
+				_ = windows.CloseHandle(flushHandle)
+			}
+		}()
 	}
 
 	// The maximum size is the area of the file, starting from 0,
@@ -70,12 +89,12 @@ func mmap(len int, prot, flags, hfile uintptr, off int64) ([]byte, error) {
 	if addr == 0 {
 		return nil, os.NewSyscallError("MapViewOfFile", errno)
 	}
+
 	handleLock.Lock()
-	handleMap[addr] = &addrinfo{
-		file:     windows.Handle(hfile),
-		writable: writable,
-	}
+	handleMap[addr] = &addrinfo{file: flushHandle}
 	handleLock.Unlock()
+
+	mapped = true
 
 	m := MMap{}
 	dh := m.header()
@@ -88,23 +107,24 @@ func mmap(len int, prot, flags, hfile uintptr, off int64) ([]byte, error) {
 
 func (m MMap) flush() error {
 	addr, len := m.addrLen()
+	handleLock.Lock()
+	handle, ok := handleMap[addr]
+	handleLock.Unlock()
+	if !ok {
+		return errors.New("unknown base address")
+	}
+	if handle.file == 0 {
+		// No need to flush if our data doesn't land on disk
+		return nil
+	}
+
 	errno := windows.FlushViewOfFile(addr, len)
 	if errno != nil {
 		return os.NewSyscallError("FlushViewOfFile", errno)
 	}
 
-	handleLock.Lock()
-	defer handleLock.Unlock()
-	handle, ok := handleMap[addr]
-	if !ok {
-		// should be impossible; we would've errored above
-		return errors.New("unknown base address")
-	}
-
-	if handle.writable && handle.file != windows.Handle(^uintptr(0)) {
-		if err := windows.FlushFileBuffers(handle.file); err != nil {
-			return os.NewSyscallError("FlushFileBuffers", err)
-		}
+	if err := windows.FlushFileBuffers(handle.file); err != nil {
+		return os.NewSyscallError("FlushFileBuffers", err)
 	}
 
 	return nil
@@ -126,19 +146,21 @@ func (m MMap) unmap() error {
 	flushErr := m.flush()
 
 	addr := m.header().Data
-	// Lock the UnmapViewOfFile along with the handleMap deletion.
-	// As soon as we unmap the view, the OS is free to give the
-	// same addr to another new map. We don't want another goroutine
-	// to insert and remove the same addr into handleMap while
-	// we're trying to remove our old addr/handle pair.
+	// First retrieve and remove our addr from the handle map
 	handleLock.Lock()
-	defer handleLock.Unlock()
-	if _, ok := handleMap[addr]; !ok {
+	handle, ok := handleMap[addr]
+	if !ok {
+		handleLock.Unlock()
 		return errors.New("unknown base address")
 	}
-	if err := windows.UnmapViewOfFile(addr); err != nil {
-		return err
-	}
 	delete(handleMap, addr)
-	return flushErr
+	handleLock.Unlock()
+
+	unmapErr := os.NewSyscallError("UnmapViewOfFile", windows.UnmapViewOfFile(addr))
+
+	var closeFileErr error
+	if handle.file != 0 {
+		closeFileErr = os.NewSyscallError("CloseHandle", windows.CloseHandle(handle.file))
+	}
+	return errors.Join(flushErr, unmapErr, closeFileErr)
 }
