@@ -13,6 +13,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -88,10 +89,11 @@ func TestFlags(t *testing.T) {
 	if err != nil {
 		t.Errorf("error mapping: %s", err)
 	}
-	defer mmap.Unmap()
 
 	mmap[9] = 'X'
-	mmap.Flush()
+	if err := mmap.Flush(); err != nil {
+		t.Errorf("error flushing: %s", err)
+	}
 
 	fileData, err := ioutil.ReadAll(f)
 	if err != nil {
@@ -99,6 +101,9 @@ func TestFlags(t *testing.T) {
 	}
 	if !bytes.Equal(fileData, testData) {
 		t.Errorf("file was modified")
+	}
+	if err := mmap.Unmap(); err != nil {
+		t.Errorf("error unmapping: %s", err)
 	}
 }
 
@@ -213,4 +218,61 @@ func TestFaultError(t *testing.T) {
 	reader.Size()
 	reader.Seek(10, io.SeekStart)
 	reader.Len()
+}
+
+// TestUnmapReleasesFile checks that the file is no longer mapped after Unmap.
+func TestUnmapReleasesFile(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("only Windows refuses to truncate a file that is still mapped")
+	}
+	tests := []struct {
+		name string
+		flag int
+		prot int
+	}{
+		{"RDONLY", os.O_RDONLY, RDONLY},
+		{"RDWR", os.O_RDWR, RDWR},
+		// Unmap of a COPY mapping used to fail and leak on Windows when the file was opened read-only.
+		{"COPY", os.O_RDONLY, COPY},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "testdata")
+			if err := os.WriteFile(path, testData, 0644); err != nil {
+				t.Fatal(err)
+			}
+			f, err := os.OpenFile(path, test.flag, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+
+			mmap, err := Map(f, test.prot, 0)
+			if err != nil {
+				t.Fatalf("error mapping: %s", err)
+			}
+			if err := mmap.Unmap(); err != nil {
+				t.Errorf("error unmapping: %s", err)
+			}
+			// In Windows we can't truncate a file while it is still mapped,
+			// so if Unmap doesn't release the mapping completely, the truncation will fail.
+			// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setendoffile
+			if err := os.Truncate(path, 0); err != nil {
+				t.Errorf("file is still mapped after Unmap: %s", err)
+			}
+
+		})
+	}
+}
+
+func TestUnmapCopyAfterFileClosed(t *testing.T) {
+	f := openFile(os.O_RDONLY)
+	mmap, err := Map(f, COPY, 0)
+	f.Close()
+	if err != nil {
+		t.Fatalf("error mapping: %s", err)
+	}
+	if err := mmap.Unmap(); err != nil {
+		t.Errorf("error unmapping: %s", err)
+	}
 }
