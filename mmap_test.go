@@ -34,6 +34,13 @@ func openFile(flags int) *os.File {
 	return f
 }
 
+func unmap(t *testing.T, m MMap) {
+	t.Helper()
+	if err := m.Unmap(); err != nil {
+		t.Errorf("error unmapping: %s", err)
+	}
+}
+
 func TestUnmap(t *testing.T) {
 	f := openFile(os.O_RDONLY)
 	defer f.Close()
@@ -53,7 +60,7 @@ func TestReadWrite(t *testing.T) {
 	if err != nil {
 		t.Errorf("error mapping: %s", err)
 	}
-	defer mmap.Unmap()
+	defer unmap(t, mmap)
 	if !bytes.Equal(testData, mmap) {
 		t.Errorf("mmap != testData: %q, %q", mmap, testData)
 	}
@@ -102,9 +109,7 @@ func TestFlags(t *testing.T) {
 	if !bytes.Equal(fileData, testData) {
 		t.Errorf("file was modified")
 	}
-	if err := mmap.Unmap(); err != nil {
-		t.Errorf("error unmapping: %s", err)
-	}
+	unmap(t, mmap)
 }
 
 // Test that we can map files from non-0 offsets
@@ -132,7 +137,7 @@ func TestNonZeroOffset(t *testing.T) {
 	if err != nil {
 		t.Errorf("error mapping file: %s", err)
 	}
-	m.Unmap()
+	unmap(t, m)
 	fileobj.Close()
 
 	// Map the second page by itself
@@ -189,7 +194,7 @@ func TestFaultError(t *testing.T) {
 	reader := faultyMmap.Reader()
 
 	// To cause a fault on our reads, unmap the region
-	faultyMmap.Unmap()
+	unmap(t, faultyMmap)
 
 	var buffer = make([]byte, size)
 
@@ -273,6 +278,54 @@ func TestUnmapCopyAfterFileClosed(t *testing.T) {
 		t.Fatalf("error mapping: %s", err)
 	}
 	if err := mmap.Unmap(); err != nil {
+		t.Errorf("error unmapping: %s", err)
+	}
+}
+
+func TestFlushAfterFileClosed(t *testing.T) {
+	// t.TempDir cleanup fails the test on Windows if Unmap leaks a file handle
+	// since Go's default handle share rights on Windows prevent the file from being deleted.
+	path := filepath.Join(t.TempDir(), "data")
+	if err := os.WriteFile(path, testData, 0644); err != nil {
+		t.Fatalf("error writing file: %s", err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("error opening file: %s", err)
+	}
+	mmap, err := Map(f, RDWR, 0)
+	f.Close()
+	if err != nil {
+		t.Fatalf("error mapping: %s", err)
+	}
+
+	mmap[9] = 'X'
+	if err := mmap.Flush(); err != nil {
+		t.Errorf("error flushing: %s", err)
+	}
+	if err := mmap.Unmap(); err != nil {
+		t.Errorf("error unmapping: %s", err)
+	}
+
+	fileData, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("error reading file: %s", err)
+	}
+	if !bytes.Equal(fileData, []byte("012345678XABCDEF")) {
+		t.Errorf("file wasn't modified: %q", fileData)
+	}
+}
+
+func TestFlushAnonymousMapping(t *testing.T) {
+	mem, err := MapRegion(nil, os.Getpagesize(), RDWR, ANON, 0)
+	if err != nil {
+		t.Fatalf("error mapping: %s", err)
+	}
+	mem[0] = 0x55
+	if err := mem.Flush(); err != nil {
+		t.Errorf("error flushing: %s", err)
+	}
+	if err := mem.Unmap(); err != nil {
 		t.Errorf("error unmapping: %s", err)
 	}
 }

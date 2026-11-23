@@ -73,10 +73,12 @@ func MapRegion(f *os.File, length int, prot, flags int, offset int64) (MMap, err
 		if length <= 0 {
 			return nil, errors.New("anonymous mapping requires non-zero length")
 		}
-		fd = ^uintptr(0)
+		fd = anonymousMappingFd
 	}
 	return mmap(length, uintptr(prot), uintptr(flags), fd, offset)
 }
+
+const anonymousMappingFd = ^uintptr(0)
 
 func (m *MMap) header() *reflect.SliceHeader {
 	return (*reflect.SliceHeader)(unsafe.Pointer(m))
@@ -111,6 +113,8 @@ func (m MMap) Flush() error {
 // result in undefined behavior.
 // Unmap should only be called on the slice value that was originally returned from
 // a call to Map. Calling Unmap on a derived slice may cause errors.
+// Unmap must not be called concurrently with any other method on the same mapping;
+// doing so results in undefined behavior.
 func (m *MMap) Unmap() error {
 	err := m.unmap()
 	*m = nil
